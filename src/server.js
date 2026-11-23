@@ -227,7 +227,7 @@ app.post('/upload', {
         }
     }
 }, async (req, reply) => {
-    const token = req.headers['X-UPLOAD-TOKEN'];
+    const token = req.headers['x-upload-token'];
     if (!isValidToken(token)) {
         req.log.warn({ ip: req.ip }, 'Upload ditolak: token tidak valid');
         return reply.code(401).send({ ok: false, error: 'Unauthorized' });
@@ -352,86 +352,171 @@ app.post('/upload', {
 });
 
 function resolveSafeFilePath(rawRelativePath) {
-  if (!rawRelativePath || typeof rawRelativePath !== 'string') {
-    return null;
-  }
+    if (!rawRelativePath || typeof rawRelativePath !== 'string') {
+        return null;
+    }
 
-  const normalized = rawRelativePath.replaceAll('\\', '/').trim();
-  const segments = normalized
-    .split('/')
-    .filter((seg) => seg.length > 0 && seg !== '.' && seg !== '..');
+    const normalized = rawRelativePath.replaceAll('\\', '/').trim();
+    const segments = normalized
+                    .split('/')
+                    .filter((seg) => seg.length > 0 && seg !== '.' && seg !== '..');
 
-  if (segments.length === 0) {
-    return null;
-  }
+    if (segments.length === 0) {
+        return null;
+    }
 
-  const rootDir = path.resolve(UPLOAD_DIR);
-  const resolvedPath = path.resolve(rootDir, ...segments);
+    const rootDir = path.resolve(UPLOAD_DIR);
+    const resolvedPath = path.resolve(rootDir, ...segments);
 
-  // Wajib berada strictly di dalam rootDir
-  if (!resolvedPath.startsWith(rootDir + path.sep)) {
-    return null;
-  }
+    // Wajib berada strictly di dalam rootDir
+    if (!resolvedPath.startsWith(rootDir + path.sep)) {
+        return null;
+    }
 
-  return resolvedPath;
+    return resolvedPath;
 }
 
 app.get('/file', async (req, reply) => {
-  const token = req.headers['X-UPLOAD-TOKEN'];
-  if (!isValidToken(token)) {
-    return reply.code(401).send({
-      ok: false,
-      error: 'Unauthorized: token tidak valid'
-    });
-  }
-
-  const rawPath = req.query?.path;
-  const forceDownload = req.query?.download === '1' || req.query?.download === 'true';
-  const filePath = resolveSafeFilePath(rawPath);
-
-  if (!filePath) {
-    return reply.code(400).send({
-      ok: false,
-      error: 'Parameter path tidak valid'
-    });
-  }
-
-  try {
-    const stat = await fs.promises.stat(filePath);
-    if (!stat.isFile()) {
-      return reply.code(404).send({
-        ok: false,
-        error: 'Dokumen tidak ditemukan'
-      });
+    const token = req.headers['x-upload-token'];
+    if (!isValidToken(token)) {
+        return reply.code(401).send({
+            ok: false,
+            error: 'Unauthorized: token tidak valid'
+        });
     }
 
-    const ext = path.extname(filePath).toLowerCase();
-    const fileName = path.basename(filePath);
-    const contentType = MIME_BY_EXT[ext] || 'application/octet-stream';
-    const dispositionType = forceDownload ? 'attachment' : 'inline';
+    const rawPath = req.query?.path;
+    const forceDownload = req.query?.download === '1' || req.query?.download === 'true';
+    const filePath = resolveSafeFilePath(rawPath);
 
-    reply.header('Content-Type', contentType);
-    reply.header('Content-Length', stat.size);
-    reply.header(
-      'Content-Disposition',
-      `${dispositionType}; filename="${fileName.replaceAll('"', '')}"`
-    );
-
-    return reply.send(fs.createReadStream(filePath));
-  } catch (err) {
-    if (err?.code === 'ENOENT') {
-      return reply.code(404).send({
-        ok: false,
-        error: 'Dokumen tidak ditemukan'
-      });
+    if (!filePath) {
+        return reply.code(400).send({
+            ok: false,
+            error: 'Parameter path tidak valid'
+        });
     }
 
-    req.log.error(err);
-    return reply.code(500).send({
-      ok: false,
-      error: 'Gagal membaca dokumen'
-    });
-  }
+    try {
+        const stat = await fs.promises.stat(filePath);
+        if (!stat.isFile()) {
+            return reply.code(404).send({
+                ok: false,
+                error: 'Dokumen tidak ditemukan'
+            });
+        }
+
+        const ext = path.extname(filePath).toLowerCase();
+        const fileName = path.basename(filePath);
+        const contentType = MIME_BY_EXT[ext] || 'application/octet-stream';
+        const dispositionType = forceDownload ? 'attachment' : 'inline';
+
+        reply.header('Content-Type', contentType);
+        reply.header('Content-Length', stat.size);
+        reply.header(
+            'Content-Disposition',
+            `${dispositionType}; filename="${fileName.replaceAll('"', '')}"`
+        );
+
+        return reply.send(fs.createReadStream(filePath));
+    } catch (err) {
+        if (err?.code === 'ENOENT') {
+            return reply.code(404).send({
+            ok: false,
+            error: 'Dokumen tidak ditemukan'
+            });
+        }
+
+        req.log.error(err);
+        return reply.code(500).send({
+            ok: false,
+            error: 'Gagal membaca dokumen'
+        });
+    }
+});
+
+function sanitizeDownloadName(rawName, fallbackExt = '') {
+    if (!rawName || typeof rawName !== 'string') {
+        return `dokumen${fallbackExt}`;
+    }
+
+    const base = path.basename(rawName.replaceAll('\\', '/')).trim();
+    const cleaned = base
+                    .replace(/[\r\n"]/g, '')
+                    .replace(/[^a-zA-Z0-9._ -]/g, '_')
+                    .trim();
+
+    if (!cleaned) {
+        return `dokumen${fallbackExt}`;
+    }
+
+    // Jika nama asli tidak punya ekstensi tapi file di disk punya, sertakan ekstensinya
+    if (!path.extname(cleaned) && fallbackExt) {
+        return `${cleaned}${fallbackExt}`;
+    }
+
+    return cleaned;
+}
+
+app.get('/download', async (req, reply) => {
+    const token = req.headers['x-upload-token'];
+    if (!isValidToken(token)) {
+        return reply.code(401).send({
+            ok: false,
+            error: 'Unauthorized: token tidak valid'
+        });
+    }
+
+    const rawPath = req.query?.path;
+    const requestedName = req.query?.filename;
+    const filePath = resolveSafeFilePath(rawPath);
+
+    if (!filePath) {
+        return reply.code(400).send({
+            ok: false,
+            error: 'Parameter path tidak valid'
+        });
+    }
+
+    try {
+        const stat = await fs.promises.stat(filePath);
+        if (!stat.isFile()) {
+            return reply.code(404).send({
+                ok: false,
+                error: 'Dokumen tidak ditemukan'
+            });
+        }
+
+        const ext = path.extname(filePath).toLowerCase();
+        const diskFileName = path.basename(filePath);
+        const downloadName = sanitizeDownloadName(
+            requestedName ? String(requestedName) : diskFileName,
+            ext
+        );
+        const contentType = MIME_BY_EXT[ext] || 'application/octet-stream';
+        const encodedName = encodeURIComponent(downloadName);
+
+        reply.header('Content-Type', contentType);
+        reply.header('Content-Length', stat.size);
+        reply.header(
+            'Content-Disposition',
+            `attachment; filename="${downloadName}"; filename*=UTF-8''${encodedName}`
+        );
+
+        return reply.send(fs.createReadStream(filePath));
+    } catch (err) {
+        if (err?.code === 'ENOENT') {
+            return reply.code(404).send({
+            ok: false,
+            error: 'Dokumen tidak ditemukan'
+            });
+        }
+
+        req.log.error(err);
+        return reply.code(500).send({
+            ok: false,
+            error: 'Gagal mengunduh dokumen'
+        });
+    }
 });
 
 try {

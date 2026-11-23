@@ -227,7 +227,7 @@ app.post('/upload', {
         }
     }
 }, async (req, reply) => {
-    const token = req.headers['x-upload-token'];
+    const token = req.headers['X-UPLOAD-TOKEN'];
     if (!isValidToken(token)) {
         req.log.warn({ ip: req.ip }, 'Upload ditolak: token tidak valid');
         return reply.code(401).send({ ok: false, error: 'Unauthorized' });
@@ -349,6 +349,89 @@ app.post('/upload', {
     } finally {
         activeUploads -= 1;
     }
+});
+
+function resolveSafeFilePath(rawRelativePath) {
+  if (!rawRelativePath || typeof rawRelativePath !== 'string') {
+    return null;
+  }
+
+  const normalized = rawRelativePath.replaceAll('\\', '/').trim();
+  const segments = normalized
+    .split('/')
+    .filter((seg) => seg.length > 0 && seg !== '.' && seg !== '..');
+
+  if (segments.length === 0) {
+    return null;
+  }
+
+  const rootDir = path.resolve(UPLOAD_DIR);
+  const resolvedPath = path.resolve(rootDir, ...segments);
+
+  // Wajib berada strictly di dalam rootDir
+  if (!resolvedPath.startsWith(rootDir + path.sep)) {
+    return null;
+  }
+
+  return resolvedPath;
+}
+
+app.get('/file', async (req, reply) => {
+  const token = req.headers['X-UPLOAD-TOKEN'];
+  if (!isValidToken(token)) {
+    return reply.code(401).send({
+      ok: false,
+      error: 'Unauthorized: token tidak valid'
+    });
+  }
+
+  const rawPath = req.query?.path;
+  const forceDownload = req.query?.download === '1' || req.query?.download === 'true';
+  const filePath = resolveSafeFilePath(rawPath);
+
+  if (!filePath) {
+    return reply.code(400).send({
+      ok: false,
+      error: 'Parameter path tidak valid'
+    });
+  }
+
+  try {
+    const stat = await fs.promises.stat(filePath);
+    if (!stat.isFile()) {
+      return reply.code(404).send({
+        ok: false,
+        error: 'Dokumen tidak ditemukan'
+      });
+    }
+
+    const ext = path.extname(filePath).toLowerCase();
+    const fileName = path.basename(filePath);
+    const contentType = MIME_BY_EXT[ext] || 'application/octet-stream';
+    const dispositionType = forceDownload ? 'attachment' : 'inline';
+
+    reply.header('Content-Type', contentType);
+    reply.header('Content-Length', stat.size);
+    reply.header(
+      'Content-Disposition',
+      `${dispositionType}; filename="${fileName.replaceAll('"', '')}"`
+    );
+
+    return reply.send(fs.createReadStream(filePath));
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      return reply.code(404).send({
+        ok: false,
+        error: 'Dokumen tidak ditemukan'
+      });
+    }
+
+    req.log.error(err);
+    return reply.code(500).send({
+      ok: false,
+      error: 'Gagal membaca dokumen'
+    });
+  }
 });
 
 try {

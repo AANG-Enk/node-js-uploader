@@ -1,0 +1,17 @@
+{
+  "name": "nas-uploader",
+  "version": "1.0.0",
+  "description": "untuk upload dokumen ke asus nas",
+  "type": "module",
+  "author": "Tech Journey Mad People",
+  "license": "MIT",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^9.0.0",
+    "dotenv": "^16.4.5",
+    "fastify": "^5.0.0"
+  }
+}

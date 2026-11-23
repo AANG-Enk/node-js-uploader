@@ -104,100 +104,135 @@ app.post('/upload', async (req, reply) => {
         });
     }
 
-    let filePart = null;
     let requestedFolder = '';
+    let uploadResult = null;
+    let earlyErrorResponse = null;
 
-    // Iterasi multipart parts agar field non-file (seperti `folder`) terbaca walau dikirim sebelum/sesudah `file`
+    // Proses langsung di dalam loop agar stream file dikonsumsi tuntas tanpa menahan req.parts()
     for await (const part of req.parts()) {
+        if (earlyErrorResponse) {
+            if (part.type === 'file') {
+                part.file.resume();
+            }
+            continue;
+        }
+
         if (part.type === 'field') {
             if (part.fieldname === 'folder') {
                 requestedFolder = String(part.value || '');
+                console.log('Request Folder :', requestedFolder);
             }
-        } else if (part.type === 'file') {
-            if (part.fieldname === 'file' && !filePart) {
-                filePart = part;
-            } else {
-                // Konsumsi file tambahan jika ada agar stream tidak menggantung
+            continue;
+        }
+
+        if (part.type === 'file') {
+            if (part.fieldname !== 'file' || uploadResult) {
                 part.file.resume();
+                continue;
+            }
+
+            const originalName = part.filename || '';
+            const ext = path.extname(originalName).toLowerCase();
+
+            if (!ALLOWED_EXTS.has(ext)) {
+                part.file.resume();
+                earlyErrorResponse = {
+                    code: 400,
+                    body: {
+                        ok: false,
+                        error: `Ekstensi file '${ext || 'tidak diketahui'}' tidak diizinkan`
+                    }
+                };
+                continue;
+            }
+
+            const cleanSubFolder = sanitizeSubFolder(requestedFolder);
+            const docId = crypto.randomUUID();
+            const safeFileName = sanitizeFileName(originalName, ext);
+
+            // Struktur akhir: <UPLOAD_DIR>/<cleanSubFolder>/<docId>/<safeFileName>
+            const relativeDir = cleanSubFolder
+                ? path.posix.join(cleanSubFolder, docId)
+                : docId;
+
+            const normalizedRoot = path.resolve(UPLOAD_DIR);
+            const docDir = path.resolve(normalizedRoot, ...relativeDir.split('/'));
+
+            if (!docDir.startsWith(normalizedRoot + path.sep)) {
+                part.file.resume();
+                earlyErrorResponse = {
+                    code: 400,
+                    body: {
+                        ok: false,
+                        error: 'Path folder tidak valid'
+                    }
+                };
+                continue;
+            }
+
+            await fs.promises.mkdir(docDir, { recursive: true });
+
+            const targetPath = path.join(docDir, safeFileName);
+            const relativePath = path.posix.join(relativeDir, safeFileName);
+
+            try {
+                await pipeline(part.file, fs.createWriteStream(targetPath));
+
+                if (part.file.truncated) {
+                    await fs.promises.rm(docDir, { recursive: true, force: true });
+                    earlyErrorResponse = {
+                        code: 413,
+                        body: {
+                            ok: false,
+                            error: `Ukuran file melebihi batas maksimal (${MAX_FILE_SIZE} bytes)`
+                        }
+                    };
+                    continue;
+                }
+
+                const stat = await fs.promises.stat(targetPath);
+
+                uploadResult = {
+                    docId,
+                    folder: cleanSubFolder,
+                    relativeDir,
+                    fileName: safeFileName,
+                    originalName,
+                    relativePath,
+                    size: stat.size,
+                    mimeType: part.mimetype
+                };
+
+                console.log('Upload Result :', uploadResult);
+            } catch (err) {
+                await fs.promises.rm(docDir, { recursive: true, force: true });
+                req.log.error(err);
+                earlyErrorResponse = {
+                    code: 500,
+                    body: {
+                        ok: false,
+                        error: 'Gagal menyimpan file'
+                    }
+                };
             }
         }
     }
 
-    if (!filePart) {
+    if (earlyErrorResponse) {
+        return reply.code(earlyErrorResponse.code).send(earlyErrorResponse.body);
+    }
+
+    if (!uploadResult) {
         return reply.code(400).send({
             ok: false,
             error: 'File wajib dikirim pada field multipart bernama "file"'
         });
     }
 
-    const originalName = filePart.filename || '';
-    const ext = path.extname(originalName).toLowerCase();
-
-    if (!ALLOWED_EXTS.has(ext)) {
-        filePart.file.resume();
-        return reply.code(400).send({
-            ok: false,
-            error: `Ekstensi file '${ext || 'tidak diketahui'}' tidak diizinkan`
-        });
-    }
-
-    const cleanSubFolder = sanitizeSubFolder(requestedFolder);
-    const docId = crypto.randomUUID();
-    const safeFileName = sanitizeFileName(originalName, ext);
-
-    // Struktur akhir: <UPLOAD_DIR>/<cleanSubFolder>/<docId>/<safeFileName>
-    const relativeDir = cleanSubFolder
-        ? path.posix.join(cleanSubFolder, docId)
-        : docId;
-
-    const docDir = path.resolve(UPLOAD_DIR, ...relativeDir.split('/'));
-
-    // Pastikan path hasil resolve benar-benar berada di dalam UPLOAD_DIR
-    if (!docDir.startsWith(UPLOAD_DIR + path.sep)) {
-        filePart.file.resume();
-        return reply.code(400).send({
-            ok: false,
-            error: 'Path folder tidak valid'
-        });
-    }
-
-    await fs.promises.mkdir(docDir, { recursive: true });
-
-    const targetPath = path.join(docDir, safeFileName);
-    const relativePath = path.posix.join(relativeDir, safeFileName);
-
-    try {
-        await pipeline(filePart.file, fs.createWriteStream(targetPath));
-
-        if (filePart.file.truncated) {
-            await fs.promises.rm(docDir, { recursive: true, force: true });
-            return reply.code(413).send({
-                ok: false,
-                error: `Ukuran file melebihi batas maksimal (${MAX_FILE_SIZE} bytes)`
-            });
-        }
-
-        const stat = await fs.promises.stat(targetPath);
-
-        return reply.code(201).send({
-            ok: true,
-            docId,
-            folder: cleanSubFolder,
-            relativeDir,
-            fileName: safeFileName,
-            originalName,
-            relativePath,
-            size: stat.size,
-            mimeType: filePart.mimetype
-        });
-    } catch (err) {
-        await fs.promises.rm(docDir, { recursive: true, force: true });
-        req.log.error(err);
-        return reply.code(500).send({
-            ok: false,
-            error: 'Gagal menyimpan file'
-        });
-    }
+    return reply.code(201).send({
+        ok: true,
+        ...uploadResult
+    });
 });
 
 try {
